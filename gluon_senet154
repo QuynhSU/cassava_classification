@@ -18,3 +18,173 @@ from timm.utils import *
 
 print("PyTorch Version: ",torch.__version__)
 print("Torchvision Version: ",torchvision.__version__)
+
+
+class Dataset(Dataset):
+
+
+    def __init__(self, name_imgs, labels, training, transform):
+        
+        self.name_imgs = name_imgs
+        self.labels = labels
+        self.training = training
+        self.transform = transform
+        print("Number images: ", len(self.name_imgs))
+        
+        
+    def __getitem__(self, index):
+        
+        """
+        Args:
+            index (int): Index
+        Returns:
+            tuple: (image, target) where target is class_index of the target class.
+        """
+        if self.training:
+            path, label = os.path.join("../cassava_data/train_images",self.name_imgs[index]), self.labels[index]
+        else :
+            path, label = os.path.join("../cassava_data/test_images",self.name_imgs[index]), self.labels[index]
+        img = cv2.imread(path)
+        img = cv2.resize(img, dsize=(512, 512))
+        img = img/255.0
+        img = np.moveaxis(img, 2, 0)
+        
+        
+            
+        img = torch.from_numpy(img).float()
+        if self.transform:
+            img = self.transform(img)
+          
+#         label = torch.from_numpy(label).long()
+    
+        return img, label, self.name_imgs[index]
+
+        
+        
+
+    def __len__(self):
+        return len(self.name_imgs)
+
+import os
+import pandas as pd
+
+data = pd.read_csv("../cassava_data/train.csv")
+data.head()
+data = data.values
+from timm.models import TestTimePoolHead
+from torchsummary import summary
+
+name_model = 'gluon_senet154'
+pretrained = True
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model_ft = timm.create_model(
+        name_model,
+        num_classes=5,
+        in_chans=3,
+        pretrained=pretrained,
+        checkpoint_path=None)
+# model_ft = model_ft.to(device)
+
+summary(model_ft, (3,512,512))
+model_ft = model_ft.to(device)
+
+
+from torchvision import datasets, models, transforms
+data_transforms = {
+    'train': transforms.Compose([
+        transforms.RandomHorizontalFlip(p = 0.5),
+        transforms.RandomVerticalFlip(p=0.5)
+    ]),
+    'val': transforms.Compose([
+        transforms.RandomHorizontalFlip(p= 0.5),
+        transforms.RandomVerticalFlip(p=0.5)
+    ]),
+}
+num_classes = 5
+batch_size = 8
+num_epochs = 20
+from sklearn.model_selection import KFold
+from torch.utils.data import DataLoader
+from torchsummary import summary
+from tqdm import tqdm
+name_imgs = data[:,0]
+labels = data[:,1]
+kf = KFold(n_splits=5, random_state=1, shuffle=False)
+best_acc =0
+for train_index, test_index in kf.split(name_imgs):
+    X_train, X_test = name_imgs[train_index], name_imgs[test_index]
+    y_train, y_test = labels[train_index], labels[test_index]
+#     X_train = X_train[0:20]
+#     y_train = y_train[0:20]
+#     X_test = X_test[0:20]
+#     y_test = y_test[0:20]
+    dataset_train = Dataset(X_train, y_train, training = True, transform = data_transforms['train'])
+    dataset_test = Dataset(X_test, y_test, training = True, transform = data_transforms['val'])
+    
+    
+    
+    trainLoader = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, batch_sampler=None, num_workers=3 )
+    testLoader = DataLoader(dataset_test, batch_size=batch_size, shuffle=False, batch_sampler=None, num_workers=3 )
+    #train
+    
+   
+    scaler = torch.cuda.amp.GradScaler()
+    
+    for e, epoch in enumerate(range(20)): 
+        # loop over the dataset multiple times
+        learning_rate = 0.001#lr_sch(epoch)
+        print("epoch: ", epoch)
+        print("learning_rate: ", learning_rate)
+        criterion = nn.CrossEntropyLoss()
+        criterion = criterion.to(device)
+        optimizer = optim.SGD(model_ft.parameters(), lr=learning_rate, momentum=0.9)
+#     optimizer = optimizer.to(device)
+        model_ft  = model_ft.to(device)
+        model_ft.train()
+        running_loss = 0.0
+        for i, (inputs, labels,names) in tqdm(enumerate(trainLoader), total= len(trainLoader)):
+            # get the inputs; data is a list of [inputs, labels]
+#             inputs, labels = data
+#             print("shape ", inputs.shape)
+            optimizer.zero_grad()
+            labels = labels.to(device)
+#             print(labels.shape)
+            # zero the parameter gradients
+            with torch.cuda.amp.autocast():
+                outputs= model_ft(inputs.to(device))
+                loss1 = criterion(outputs, labels)
+#                 loss2 = criterion(aux_outputs, labels)
+                loss = loss1 
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # print statistics
+        running_loss += loss.item()
+            # print every 2000 mini-batches
+        print('[%d, %5d] loss: %.3f' %
+                  (epoch + 1, i + 1, running_loss / 2000))
+        running_loss = 0.0
+        print('Finished Training')
+        correct = 0
+        total = 0
+        model_ft.eval()
+        with torch.no_grad():
+            for data in testLoader:
+                images, labels, names = data
+                images = images.to(device)
+                labels = labels.to(device)
+                outputs = model_ft(images)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                predicted.to(device)
+
+                correct += (predicted == labels).sum().item()
+        print('Accuracy : %f %%' % (100 * correct / total))
+        
+        if (correct / total)> best_acc:
+            best_acc = (correct / total)
+            torch.save(model_ft.state_dict(), '../weights/%08d_%02f.pth'%(epoch, best_acc ))
+    #break
+    
